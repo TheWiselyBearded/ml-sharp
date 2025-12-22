@@ -164,3 +164,8 @@ cython_debug/
 .DS_STORE
 *.pt
 .aider*
+
+# Local data & artifacts
+data/
+model/
+compressed/
