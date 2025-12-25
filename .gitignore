@@ -169,3 +169,18 @@ cython_debug/
 data/
 model/
 compressed/
+
+# Decompressed output directories
+decompressed/
+*_decompressed/
+*_compressed/
+
+# Compressed Gaussian splat files
+*.ply
+*.ply.gz
+*.ply.xz
+*.npz
+*.pkl.gz
+*.pkl.xz
+deltas.*
+keyframe_*.ply*

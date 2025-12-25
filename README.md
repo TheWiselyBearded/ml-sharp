@@ -13,15 +13,26 @@ We present SHARP, an approach to photorealistic view synthesis from a single ima
 
 ## Getting started
 
-We recommend to first create a python environment:
+We recommend to first create a python environment. You can do this in two ways:
+
+### Option 1: Using environment.yml (Recommended for recreating environments)
+
+Create the conda environment from the provided `environment.yml` file:
+
+```
+conda env create -f environment.yml
+conda activate sharp
+```
+
+This will create an environment named `sharp` with all dependencies installed.
+
+### Option 2: Manual setup
+
+Alternatively, you can create the environment manually:
 
 ```
 conda create -n sharp python=3.13
-```
-
-Afterwards, you can install the project using
-
-```
+conda activate sharp
 pip install -r requirements.txt
 ```
 

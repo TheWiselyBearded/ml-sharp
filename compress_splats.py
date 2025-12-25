@@ -352,6 +352,10 @@ def compute_delta(
     use_sparse: bool = True,
     match_spatially: bool = True,
     max_match_distance: float = 0.1,
+    quantize_deltas: bool = True,
+    delta_quantization_bits: int = 16,
+    adaptive_threshold: bool = True,
+    threshold_percentile: float = 50.0,
 ) -> tuple[Gaussians3D, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Compute delta between two Gaussian sets with optional spatial matching.
@@ -453,16 +457,44 @@ def compute_delta(
         
         changed_indices = None
         if use_sparse and num_matched > 0:
-            # Find which matched Gaussians have changed significantly
+            # IMPROVED: Use relative change magnitude (normalized by base values)
+            # This is more robust than absolute thresholds
+            base_matched = Gaussians3D(
+                mean_vectors=base.mean_vectors[:, base_match_idx],
+                singular_values=base.singular_values[:, base_match_idx],
+                quaternions=base.quaternions[:, base_match_idx],
+                colors=base.colors[:, base_match_idx],
+                opacities=base.opacities[:, base_match_idx],
+            )
+            
+            # Relative change: delta / (base + epsilon)
+            eps = 1e-8
+            rel_delta_mean = (delta_mean[:, :num_matched].abs() / (base_matched.mean_vectors.abs() + eps)).max(dim=-1)[0]
+            rel_delta_scales = (delta_scales[:, :num_matched].abs() / (base_matched.singular_values.abs() + eps)).max(dim=-1)[0]
+            rel_delta_colors = (delta_colors[:, :num_matched].abs() / (base_matched.colors.abs() + eps)).max(dim=-1)[0]
+            rel_delta_opacities = (delta_opacities[:, :num_matched].abs() / (base_matched.opacities.abs() + eps))
+            
+            # For quaternions, use absolute change (they're normalized)
+            abs_delta_quats = delta_quats[:, :num_matched].abs().max(dim=-1)[0]
+            
+            # Combined relative change magnitude
             change_magnitude = (
-                delta_mean[:, :num_matched].abs().max(dim=-1)[0] +
-                delta_scales[:, :num_matched].abs().max(dim=-1)[0] +
-                delta_quats[:, :num_matched].abs().max(dim=-1)[0] +
-                delta_colors[:, :num_matched].abs().max(dim=-1)[0] +
-                delta_opacities[:, :num_matched].abs()
+                rel_delta_mean +
+                rel_delta_scales +
+                abs_delta_quats * 0.1 +  # Weight quaternions less
+                rel_delta_colors +
+                rel_delta_opacities
             ).flatten()
             
-            changed_mask = change_magnitude > sparse_threshold
+            # ADAPTIVE THRESHOLD: Use percentile instead of fixed threshold
+            if adaptive_threshold:
+                threshold_value = torch.quantile(change_magnitude, threshold_percentile / 100.0).item()
+                actual_threshold = max(threshold_value, sparse_threshold)  # Don't go below minimum
+                LOGGER.debug(f"Adaptive threshold: {actual_threshold:.2e} (percentile {threshold_percentile}%)")
+            else:
+                actual_threshold = sparse_threshold
+            
+            changed_mask = change_magnitude > actual_threshold
             changed_indices = torch.where(changed_mask)[0]
             
             num_changed = len(changed_indices)
@@ -474,7 +506,7 @@ def compute_delta(
             LOGGER.info(
                 f"Delta encoding: {num_changed:,}/{num_matched:,} matched Gaussians changed "
                 f"({100 * num_changed / num_matched:.1f}%) | "
-                f"Threshold: {sparse_threshold:.2e} | "
+                f"Threshold: {actual_threshold:.2e} | "
                 f"Max: {max_delta:.2e} | Mean: {mean_delta:.2e} | Median: {median_delta:.2e}"
             )
             
@@ -501,8 +533,27 @@ def compute_delta(
                 if current_match_idx is not None:
                     current_match_idx = current_match_idx[changed_indices]
                 is_new = is_new[all_indices]
+                
+                # QUANTIZE DELTAS: Reduce precision of stored deltas
+                if quantize_deltas:
+                    if delta_quantization_bits == 16:
+                        # Float16 quantization
+                        delta_mean = delta_mean.half().float()
+                        delta_scales = delta_scales.half().float()
+                        delta_quats = delta_quats.half().float()
+                        delta_colors = delta_colors.half().float()
+                        delta_opacities = delta_opacities.half().float()
+                        LOGGER.debug("Quantized deltas to float16")
             else:
                 changed_indices = None  # Use dense encoding
+                
+                # Still quantize even if dense
+                if quantize_deltas and delta_quantization_bits == 16:
+                    delta_mean = delta_mean.half().float()
+                    delta_scales = delta_scales.half().float()
+                    delta_quats = delta_quats.half().float()
+                    delta_colors = delta_colors.half().float()
+                    delta_opacities = delta_opacities.half().float()
         
     else:
         # Original index-based matching (assumes same order)
@@ -911,6 +962,9 @@ def compress_sequence(
     sparse_delta_threshold: float = 1e-4,
     keyframe_interval: int = 10,  # Insert keyframe every N frames
     max_match_distance: float = 0.1,  # Maximum distance for spatial matching
+    quantize_deltas: bool = True,
+    adaptive_threshold: bool = True,
+    threshold_percentile: float = 50.0,
 ) -> list[CompressionStats]:
     """
     Compress a sequence of PLY files.
@@ -994,6 +1048,10 @@ def compress_sequence(
                     sparse_threshold=sparse_delta_threshold,
                     match_spatially=True,
                     max_match_distance=max_match_distance,
+                    quantize_deltas=quantize_deltas,
+                    delta_quantization_bits=16,
+                    adaptive_threshold=adaptive_threshold,
+                    threshold_percentile=threshold_percentile,
                 )
                 
                 delta_frame = DeltaFrame(
@@ -1019,20 +1077,40 @@ def compress_sequence(
                 compression_ratio=0,
             ))
         
-        # Save accumulated deltas (use binary format for efficiency)
+        # Save accumulated deltas (use numpy compressed format for better compression)
         if deltas:
-            deltas_path = output_dir / "deltas.pkl"
-            if compression == "gzip":
-                deltas_path = deltas_path.with_suffix('.pkl.gz')
-                with gzip.open(deltas_path, 'wb', compresslevel=9) as f:
-                    pickle.dump(deltas, f, protocol=pickle.HIGHEST_PROTOCOL)
-            elif compression == "lzma":
-                deltas_path = deltas_path.with_suffix('.pkl.xz')
-                with lzma.open(deltas_path, 'wb', preset=9) as f:
-                    pickle.dump(deltas, f, protocol=pickle.HIGHEST_PROTOCOL)
-            else:
-                with open(deltas_path, 'wb') as f:
-                    pickle.dump(deltas, f, protocol=pickle.HIGHEST_PROTOCOL)
+            deltas_path = output_dir / "deltas.npz"
+            
+            # Build numpy arrays for all deltas
+            delta_dict = {}
+            for i, (delta_frame, metadata) in enumerate(deltas):
+                prefix = f"frame_{i}"
+                delta_dict[f"{prefix}_mean"] = delta_frame.delta_mean.cpu().numpy()
+                delta_dict[f"{prefix}_scales"] = delta_frame.delta_scales.cpu().numpy()
+                delta_dict[f"{prefix}_quats"] = delta_frame.delta_quaternions.cpu().numpy()
+                delta_dict[f"{prefix}_colors"] = delta_frame.delta_colors.cpu().numpy()
+                delta_dict[f"{prefix}_opacities"] = delta_frame.delta_opacities.cpu().numpy()
+                
+                if delta_frame.changed_indices is not None:
+                    delta_dict[f"{prefix}_changed"] = delta_frame.changed_indices.cpu().numpy()
+                if delta_frame.base_match_indices is not None:
+                    delta_dict[f"{prefix}_base_match"] = delta_frame.base_match_indices.cpu().numpy()
+                if delta_frame.current_match_indices is not None:
+                    delta_dict[f"{prefix}_current_match"] = delta_frame.current_match_indices.cpu().numpy()
+                if delta_frame.is_new_gaussian is not None:
+                    delta_dict[f"{prefix}_is_new"] = delta_frame.is_new_gaussian.cpu().numpy()
+                
+                # Store metadata
+                delta_dict[f"{prefix}_frame_idx"] = np.array([delta_frame.frame_index])
+                delta_dict[f"{prefix}_base_idx"] = np.array([delta_frame.base_frame_index])
+                delta_dict[f"{prefix}_metadata"] = np.array([
+                    metadata.focal_length_px,
+                    metadata.resolution_px[0],
+                    metadata.resolution_px[1],
+                ])
+            
+            # Save as compressed numpy format
+            np.savez_compressed(deltas_path, **delta_dict)
             
             total_compressed_size += deltas_path.stat().st_size
             LOGGER.info(f"Saved {len(deltas)} delta frames to {deltas_path} ({deltas_path.stat().st_size / 1024 / 1024:.2f} MB)")
@@ -1102,16 +1180,83 @@ def decompress_sequence(
         save_ply(gaussians, metadata.focal_length_px, metadata.resolution_px[::-1], output_path)
         LOGGER.info(f"Decompressed keyframe {frame_idx}")
     
-    # Load and apply deltas (try binary format first, fallback to JSON)
-    delta_files = list(input_dir.glob("deltas.pkl*")) + list(input_dir.glob("deltas.json*"))
+    # Load and apply deltas (try numpy format first, then pickle, then JSON)
+    delta_files = list(input_dir.glob("deltas.npz")) + list(input_dir.glob("deltas.pkl*")) + list(input_dir.glob("deltas.json*"))
     if not delta_files:
         LOGGER.info("No delta files found, only keyframes decompressed")
         return
     
     delta_path = delta_files[0]
     
-    # Try binary format first
-    if delta_path.suffix in ['.pkl', '.gz', '.xz'] and 'pkl' in delta_path.stem:
+    # Try numpy compressed format first (most efficient)
+    if delta_path.suffix == '.npz':
+        npz_data = np.load(delta_path, allow_pickle=False)
+        
+        # Find all frame indices
+        frame_indices = []
+        for key in npz_data.keys():
+            if key.startswith('frame_') and key.endswith('_frame_idx'):
+                frame_idx = int(key.split('_')[1])
+                if frame_idx not in frame_indices:
+                    frame_indices.append(frame_idx)
+        frame_indices.sort()
+        
+        deltas = []
+        for i in frame_indices:
+            prefix = f"frame_{i}"
+            
+            delta_mean = torch.from_numpy(npz_data[f"{prefix}_mean"])
+            delta_scales = torch.from_numpy(npz_data[f"{prefix}_scales"])
+            delta_quats = torch.from_numpy(npz_data[f"{prefix}_quats"])
+            delta_colors = torch.from_numpy(npz_data[f"{prefix}_colors"])
+            delta_opacities = torch.from_numpy(npz_data[f"{prefix}_opacities"])
+            
+            changed_indices = None
+            if f"{prefix}_changed" in npz_data:
+                changed_indices = torch.from_numpy(npz_data[f"{prefix}_changed"])
+            
+            base_match_indices = None
+            if f"{prefix}_base_match" in npz_data:
+                base_match_indices = torch.from_numpy(npz_data[f"{prefix}_base_match"])
+            
+            current_match_indices = None
+            if f"{prefix}_current_match" in npz_data:
+                current_match_indices = torch.from_numpy(npz_data[f"{prefix}_current_match"])
+            
+            is_new_gaussian = None
+            if f"{prefix}_is_new" in npz_data:
+                is_new_gaussian = torch.from_numpy(npz_data[f"{prefix}_is_new"]).bool()
+            
+            frame_idx = int(npz_data[f"{prefix}_frame_idx"][0])
+            base_idx = int(npz_data[f"{prefix}_base_idx"][0])
+            metadata_arr = npz_data[f"{prefix}_metadata"]
+            
+            delta_frame = DeltaFrame(
+                frame_index=frame_idx,
+                base_frame_index=base_idx,
+                delta_mean=delta_mean,
+                delta_scales=delta_scales,
+                delta_quaternions=delta_quats,
+                delta_colors=delta_colors,
+                delta_opacities=delta_opacities,
+                changed_indices=changed_indices,
+                base_match_indices=base_match_indices,
+                current_match_indices=current_match_indices,
+                is_new_gaussian=is_new_gaussian,
+            )
+            
+            metadata = SceneMetaData(
+                focal_length_px=float(metadata_arr[0]),
+                resolution_px=(int(metadata_arr[1]), int(metadata_arr[2])),
+                color_space=base_metadata.color_space,
+            )
+            
+            deltas.append((delta_frame, metadata))
+        
+        npz_data.close()
+    
+    # Try pickle format (legacy)
+    elif delta_path.suffix in ['.pkl', '.gz', '.xz'] and 'pkl' in delta_path.stem:
         if delta_path.suffix == '.gz':
             with gzip.open(delta_path, 'rb') as f:
                 deltas = pickle.load(f)
@@ -1360,6 +1505,24 @@ Examples:
         default=0.1,
         help="Maximum 3D distance for spatial matching between frames (default: 0.1)",
     )
+    delta_group.add_argument(
+        "--threshold-percentile",
+        type=float,
+        default=50.0,
+        help="Percentile for adaptive threshold (default: 50.0, i.e., median)",
+    )
+    delta_group.add_argument(
+        "--no-adaptive-threshold",
+        dest="adaptive_threshold",
+        action="store_false",
+        help="Disable adaptive thresholding (use fixed threshold)",
+    )
+    delta_group.add_argument(
+        "--no-quantize-deltas",
+        dest="quantize_deltas",
+        action="store_false",
+        help="Disable delta quantization",
+    )
     
     # Decompress mode
     parser.add_argument(
@@ -1417,6 +1580,9 @@ Examples:
             sparse_delta_threshold=args.sparse_threshold,
             keyframe_interval=args.keyframe_interval,
             max_match_distance=args.max_match_distance,
+            quantize_deltas=getattr(args, 'quantize_deltas', True),
+            adaptive_threshold=getattr(args, 'adaptive_threshold', True),
+            threshold_percentile=getattr(args, 'threshold_percentile', 50.0),
         )
 
 
